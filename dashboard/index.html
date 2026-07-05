@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rate Limiter Dashboard</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background: #0f1117; color: #e6e6e6; margin: 0; padding: 32px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: #888; font-size: 13px; margin-bottom: 24px; }
+  .summary { display: flex; gap: 16px; margin-bottom: 24px; }
+  .card { background: #1a1d27; border-radius: 10px; padding: 16px 20px; flex: 1; }
+  .card .label { color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .card .value { font-size: 28px; font-weight: 600; margin-top: 4px; }
+  .allowed { color: #4ade80; }
+  .blocked { color: #f87171; }
+  table { width: 100%; border-collapse: collapse; background: #1a1d27; border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 10px 16px; font-size: 13px; }
+  th { color: #888; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; border-bottom: 1px solid #2a2d3a; }
+  tr:not(:last-child) td { border-bottom: 1px solid #22252f; }
+  .tier-badge { padding: 2px 8px; border-radius: 6px; font-size: 11px; }
+  .tier-free { background: #2a2d3a; color: #aaa; }
+  .tier-premium { background: #3d2f1a; color: #f5c869; }
+  .status { color: #666; font-size: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <h1>Rate Limiter Gateway — Live Dashboard</h1>
+  <div class="subtitle">Polling <code>/stats</code> every 2 seconds</div>
+
+  <div class="summary">
+    <div class="card">
+      <div class="label">Total Requests</div>
+      <div class="value" id="total">0</div>
+    </div>
+    <div class="card">
+      <div class="label">Allowed</div>
+      <div class="value allowed" id="allowed">0</div>
+    </div>
+    <div class="card">
+      <div class="label">Blocked (429)</div>
+      <div class="value blocked" id="blocked">0</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>API Key (Client)</th><th>Tier</th><th>Allowed</th><th>Blocked</th></tr>
+    </thead>
+    <tbody id="client-rows">
+      <tr><td colspan="4" style="color:#555">No requests yet. Run benchmark.py or hit /api/ping.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="status" id="status">Connecting to http://localhost:8000/stats ...</div>
+
+<script>
+const GATEWAY_URL = "http://localhost:8000";
+
+async function refresh() {
+  try {
+    const res = await fetch(`${GATEWAY_URL}/stats`);
+    const data = await res.json();
+
+    document.getElementById("total").textContent = data.total_requests;
+    document.getElementById("allowed").textContent = data.allowed;
+    document.getElementById("blocked").textContent = data.blocked;
+
+    const rows = Object.entries(data.by_client).map(([key, c]) => `
+      <tr>
+        <td>${key}</td>
+        <td><span class="tier-badge tier-${c.tier}">${c.tier}</span></td>
+        <td class="allowed">${c.allowed}</td>
+        <td class="blocked">${c.blocked}</td>
+      </tr>
+    `).join("");
+
+    document.getElementById("client-rows").innerHTML =
+      rows || `<tr><td colspan="4" style="color:#555">No requests yet.</td></tr>`;
+
+    document.getElementById("status").textContent =
+      `Last updated: ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    document.getElementById("status").textContent =
+      "Could not reach gateway at " + GATEWAY_URL + " — is the server running?";
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
