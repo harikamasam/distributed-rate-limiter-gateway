@@ -1,140 +1,156 @@
-"""
-API Gateway with Rate Limiting Middleware
+"""FastAPI gateway application."""
 
-This is the "product" layer: a FastAPI app that sits in front of demo
-backend routes and enforces per-client rate limits using the Redis
-token bucket from Phase 2.
-
-Real-world pattern this demonstrates:
-    Products like Stripe/GitHub give different rate limits per client
-    tier (free vs paid). We simulate that with a simple API-key -> tier
-    lookup. In a real system this would come from a database/auth
-    service; here it's an in-memory dict for demo purposes.
-"""
-
+import logging
+import hashlib
 import time
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import redis
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
+from uuid import uuid4
 
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from redis.asyncio import Redis, from_url
+from redis.exceptions import RedisError
+
+from app.config import Settings
+from app.metrics import ACTIVE_CLIENTS, LATENCY, RATE_LIMITED, REDIS_FAILURES, REQUESTS, prometheus_response
 from app.redis_token_bucket import RedisTokenBucketLimiter
 
-app = FastAPI(title="Rate-Limited API Gateway")
-
-# Allow the standalone dashboard/index.html (opened directly in a browser)
-# to call this API. In production you'd restrict this to your real
-# frontend's origin instead of "*".
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Redis connection ---
-# In production this would point at a managed Redis cluster (e.g. Azure
-# Cache for Redis / AWS ElastiCache) shared by every server instance.
-redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-
-# --- Per-tier rate limit config ---
-# (capacity = max burst, refill_rate = tokens/sec = sustained rate)
-TIER_LIMITS = {
-    "free": {"capacity": 5, "refill_rate": 1},         # 1 req/sec, burst of 5
-    "premium": {"capacity": 50, "refill_rate": 10},    # 10 req/sec, burst of 50
-}
-
-# Demo API-key -> tier mapping (would be a DB lookup in production)
-API_KEYS = {
-    "free-key-123": "free",
-    "premium-key-456": "premium",
-}
-
-_limiters: dict[str, RedisTokenBucketLimiter] = {
-    tier: RedisTokenBucketLimiter(redis_client, cfg["capacity"], cfg["refill_rate"])
-    for tier, cfg in TIER_LIMITS.items()
-}
-
-# In-memory stats for the dashboard (Phase 5). In production you'd push
-# these to a metrics system (Prometheus, CloudWatch, etc.) instead.
-stats = {
-    "total_requests": 0,
-    "allowed": 0,
-    "blocked": 0,
-    "by_client": {},
-}
+logger = logging.getLogger("rate_limiter_gateway")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    # Only guard routes under /api/ -- dashboard/stats endpoints stay open
-    if not request.url.path.startswith("/api/"):
-        return await call_next(request)
-
-    api_key = request.headers.get("X-API-Key")
-    if api_key is None or api_key not in API_KEYS:
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Missing or invalid X-API-Key header"},
+def create_app(settings: Optional[Settings] = None, redis_client: Optional[Redis] = None) -> FastAPI:
+    config = settings or Settings.from_env()
+    owns_redis_client = redis_client is None
+    if redis_client is None:
+        redis_client = from_url(
+            config.redis_url,
+            decode_responses=False,
+            socket_connect_timeout=config.redis_connect_timeout,
+            socket_timeout=config.redis_socket_timeout,
+            health_check_interval=30,
+            max_connections=100,
         )
+    limiters = {tier: RedisTokenBucketLimiter(redis_client, limit.capacity, limit.refill_rate)
+                for tier, limit in config.tiers.items()}
+    counters = {"total_requests": 0, "allowed": 0, "blocked": 0, "by_tier": {}}
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        if owns_redis_client:
+            await redis_client.aclose()
 
-    tier = API_KEYS[api_key]
-    limiter = _limiters[tier]
-    allowed, meta = limiter.allow_request(client_id=api_key)
+    app = FastAPI(title="Distributed Rate Limiter Gateway", version="1.0.0", lifespan=lifespan)
+    app.state.settings = config
+    app.state.redis = redis_client
+    app.state.limiters = limiters
+    app.state.counters = counters
 
-    # --- update stats for dashboard ---
-    stats["total_requests"] += 1
-    client_stats = stats["by_client"].setdefault(
-        api_key, {"allowed": 0, "blocked": 0, "tier": tier}
-    )
-    if allowed:
-        stats["allowed"] += 1
-        client_stats["allowed"] += 1
-    else:
-        stats["blocked"] += 1
-        client_stats["blocked"] += 1
+    app.add_middleware(CORSMiddleware, allow_origins=list(config.cors_origins),
+                       allow_methods=["GET"], allow_headers=["X-API-Key", "X-Request-ID", "Content-Type"])
 
-    if not allowed:
-        return JSONResponse(
-            status_code=429,
-            content={
-                "error": "Rate limit exceeded",
-                "retry_after_seconds": meta["retry_after_seconds"],
-            },
-            headers={"Retry-After": str(int(meta["retry_after_seconds"]) + 1)},
-        )
+    @app.middleware("http")
+    async def request_middleware(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or uuid4().hex
+        request.state.request_id = request_id
+        started = time.perf_counter()
+        tier = "anonymous"
+        try:
+            if request.url.path.startswith("/api/"):
+                api_key = request.headers.get("X-API-Key")
+                tier = config.api_keys.get(api_key, "anonymous") if api_key else "anonymous"
+                if not api_key or tier == "anonymous":
+                    response = JSONResponse(status_code=401, content={"error": "Missing or invalid API key", "request_id": request_id})
+                else:
+                    client_id = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:32]
+                    allowed, meta = await limiters[tier].allow_request(client_id)
+                    counters["total_requests"] += 1
+                    tier_stats = counters["by_tier"].setdefault(tier, {"allowed": 0, "blocked": 0})
+                    if not allowed:
+                        counters["blocked"] += 1
+                        tier_stats["blocked"] += 1
+                        RATE_LIMITED.labels(tier=tier).inc()
+                        retry = max(1, int(meta["retry_after_seconds"] + 0.999))
+                        response = JSONResponse(status_code=429, content={"error": "Rate limit exceeded", "retry_after_seconds": meta["retry_after_seconds"], "request_id": request_id}, headers={"Retry-After": str(retry)})
+                        response.headers.update(_rate_headers(meta))
+                    else:
+                        counters["allowed"] += 1
+                        tier_stats["allowed"] += 1
+                        ACTIVE_CLIENTS.set(len(config.api_keys))
+                        response = await call_next(request)
+                        response.headers.update(_rate_headers(meta))
+            else:
+                response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            REQUESTS.labels(request.url.path, request.method, str(response.status_code), tier).inc()
+            return response
+        except (RedisError, TimeoutError) as exc:
+            REDIS_FAILURES.inc()
+            logger.warning("Redis rate-limit operation failed request_id=%s error=%s", request_id, type(exc).__name__)
+            if config.redis_failure_mode == "open" and request.url.path.startswith("/api/"):
+                response = await call_next(request)
+                response.headers["X-RateLimit-Failure-Mode"] = "open"
+            else:
+                response = JSONResponse(status_code=503, content={"error": "Rate limiting service unavailable", "request_id": request_id})
+            response.headers["X-Request-ID"] = request_id
+            return response
+        finally:
+            LATENCY.labels(request.url.path).observe(time.perf_counter() - started)
 
-    response = await call_next(request)
-    # Expose remaining quota to the client, like real APIs do
-    response.headers["X-RateLimit-Remaining"] = str(meta["remaining_tokens"])
-    response.headers["X-RateLimit-Capacity"] = str(meta["capacity"])
-    return response
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.get("/", include_in_schema=False)
+    async def dashboard():
+        dashboard_path = Path(__file__).resolve().parent.parent / "dashboard" / "index.html"
+        return FileResponse(dashboard_path, media_type="text/html")
+
+    @app.get("/ready")
+    async def ready():
+        try:
+            await redis_client.ping()
+        except (RedisError, TimeoutError):
+            return JSONResponse(status_code=503, content={"status": "not_ready", "redis": "unavailable"})
+        return {"status": "ready", "redis": "ok"}
+
+    @app.get("/metrics")
+    async def metrics():
+        return prometheus_response()
+
+    @app.get("/stats")
+    async def stats():
+        return counters
+
+    @app.get("/api/ping")
+    async def ping():
+        return {"message": "pong", "timestamp": time.time()}
+
+    @app.get("/api/data")
+    async def data():
+        return {"data": [1, 2, 3, 4, 5], "note": "This route is rate-limited"}
+
+    @app.get("/api/status")
+    async def status():
+        return {"service": "rate-limiter-gateway", "tiers": list(config.tiers)}
+
+    @app.get("/api/limits")
+    async def limits(request: Request):
+        tier = config.api_keys[request.headers["X-API-Key"]]
+        limit = config.tiers[tier]
+        return {"tier": tier, "capacity": limit.capacity, "refill_rate": limit.refill_rate}
+
+    return app
 
 
-# --- Demo protected routes (stand-ins for a "real" backend) ---
-
-@app.get("/api/ping")
-async def ping():
-    return {"message": "pong", "timestamp": time.time()}
-
-
-@app.get("/api/data")
-async def get_data():
-    return {"data": [1, 2, 3, 4, 5], "note": "This route is rate-limited"}
+def _rate_headers(meta: dict) -> dict:
+    reset = int(time.time() + meta["retry_after_seconds"])
+    return {"X-RateLimit-Limit": str(meta["capacity"]),
+            "X-RateLimit-Remaining": str(meta["remaining_tokens"]),
+            "X-RateLimit-Reset": str(reset)}
 
 
-# --- Dashboard/stats endpoints (NOT rate-limited, used by Phase 5) ---
-
-@app.get("/stats")
-async def get_stats():
-    return stats
-
-
-@app.get("/health")
-async def health():
-    try:
-        redis_client.ping()
-        redis_ok = True
-    except redis.exceptions.ConnectionError:
-        redis_ok = False
-    return {"status": "ok" if redis_ok else "degraded", "redis_connected": redis_ok}
+app = create_app()

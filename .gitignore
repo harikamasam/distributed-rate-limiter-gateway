@@ -4,3 +4,6 @@ __pycache__/
 venv/
 .DS_Store
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+benchmarks/results/

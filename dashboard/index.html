@@ -25,7 +25,7 @@
 </head>
 <body>
   <h1>Rate Limiter Gateway — Live Dashboard</h1>
-  <div class="subtitle">Polling <code>/stats</code> every 2 seconds</div>
+  <div class="subtitle">Polling <code>/stats</code> every 2 seconds. Secrets are never displayed.</div>
 
   <div class="summary">
     <div class="card">
@@ -44,10 +44,10 @@
 
   <table>
     <thead>
-      <tr><th>API Key (Client)</th><th>Tier</th><th>Allowed</th><th>Blocked</th></tr>
+      <tr><th>Tier</th><th>Allowed</th><th>Blocked</th></tr>
     </thead>
     <tbody id="client-rows">
-      <tr><td colspan="4" style="color:#555">No requests yet. Run benchmark.py or hit /api/ping.</td></tr>
+      <tr><td colspan="3" style="color:#555">No requests yet. Run benchmark.py or hit /api/ping.</td></tr>
     </tbody>
   </table>
 
@@ -65,17 +65,16 @@ async function refresh() {
     document.getElementById("allowed").textContent = data.allowed;
     document.getElementById("blocked").textContent = data.blocked;
 
-    const rows = Object.entries(data.by_client).map(([key, c]) => `
+    const rows = Object.entries(data.by_tier || {}).map(([tier, c]) => `
       <tr>
-        <td>${key}</td>
-        <td><span class="tier-badge tier-${c.tier}">${c.tier}</span></td>
+        <td><span class="tier-badge tier-${tier}">${tier}</span></td>
         <td class="allowed">${c.allowed}</td>
         <td class="blocked">${c.blocked}</td>
       </tr>
     `).join("");
 
     document.getElementById("client-rows").innerHTML =
-      rows || `<tr><td colspan="4" style="color:#555">No requests yet.</td></tr>`;
+      rows || `<tr><td colspan="3" style="color:#555">No requests yet.</td></tr>`;
 
     document.getElementById("status").textContent =
       `Last updated: ${new Date().toLocaleTimeString()}`;
